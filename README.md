@@ -7,6 +7,8 @@ Cloudflare CORS proxy in a worker. This worker enables cross-origin requests by 
 https://your-worker.workers.dev/?url=https://api.example.com/data
 ```
 
+Access the worker without a target URL to see the info page with usage instructions, version information, and request details.
+
 CLOUDFLARE-CORS-ANYWHERE
 
 Authors:
@@ -70,10 +72,24 @@ The `wrangler.toml` file contains the basic configuration:
 -   `main`: Entry point file (index.js)
 -   `compatibility_date`: Cloudflare Workers API version
 -   `observability`: Logging configuration (enabled by default with 100% sampling rate)
+-   `version_metadata`: Version metadata binding for deployment tracking
 
 You can customize the worker name in `wrangler.toml` if desired. The observability section enables free logging with:
 - **Free Tier**: 200,000 log events per day with 3-day retention
 - **Sampling Rate**: 100% (all requests are logged)
+
+#### Version Information
+
+The worker automatically tracks version information from multiple sources (in priority order):
+1. **Cloudflare Version Metadata** (if using Workers Versions API)
+2. **VERSION environment variable** (set via `wrangler.toml` [vars] or `wrangler secret put VERSION`)
+3. **Package version** (from `package.json`)
+
+Version information is displayed in:
+- Logs (for debugging and tracking)
+- Info page (when accessing the worker without a target URL)
+
+The deployment script (`npm run deploy`) automatically sets the VERSION environment variable from `package.json`.
 
 #### Whitelist and Blacklist Configuration
 
@@ -133,6 +149,17 @@ WHITELIST_ORIGINS = '["^https://example\\.com$"]'
 1. **Deploy the worker**:
 
     ```bash
+    npm run deploy
+    ```
+
+    This command automatically:
+    - Updates the version file from `package.json`
+    - Sets the VERSION environment variable during deployment
+    - Deploys to Cloudflare Workers
+
+    Alternatively, you can use Wrangler directly:
+
+    ```bash
     wrangler deploy
     ```
 
@@ -181,6 +208,12 @@ curl "https://YOUR_WORKER_NAME.YOUR_SUBDOMAIN.workers.dev/?https://httpbin.org/g
 ### Updating the Worker
 
 To update your worker after making changes:
+
+```bash
+npm run deploy
+```
+
+This will automatically update the version and deploy. Alternatively:
 
 ```bash
 wrangler deploy
@@ -261,37 +294,98 @@ The worker supports two URL formats for specifying the target URL:
 
 Both formats are fully supported and can be used interchangeably.
 
-### Usage Example
+**Note**: URLs without a protocol (e.g., `api.example.com/data`) will automatically have `https://` prepended.
+
+### HTTP Methods
+
+All standard HTTP methods are supported:
+- `GET` - Retrieve data
+- `POST` - Send data
+- `PUT` - Update/replace data
+- `DELETE` - Delete data
+- `PATCH` - Partial update
+- `HEAD` - Get headers only
+- `OPTIONS` - CORS preflight (handled automatically)
+
+### Usage Examples
+
+#### Basic GET Request
+
+```javascript
+// Simple GET request
+fetch("https://your-worker.workers.dev/?url=https://api.example.com/data")
+    .then(res => res.json())
+    .then(console.log);
+```
+
+#### POST Request with Custom Headers
 
 ```javascript
 // Using the URL parameter format (recommended)
-fetch("https://test.cors.workers.dev/?url=https://httpbin.org/post", {
-    method: "post",
+fetch("https://your-worker.workers.dev/?url=https://httpbin.org/post", {
+    method: "POST",
     headers: {
+        "Content-Type": "application/json",
         "x-foo": "bar",
         "x-bar": "foo",
         "x-cors-headers": JSON.stringify({
             // allows to send forbidden headers
             // https://developer.mozilla.org/en-US/docs/Glossary/Forbidden_header_name
-            cookies: "x=123"
+            Cookie: "session=abc123"
         })
-    }
+    },
+    body: JSON.stringify({ key: "value" })
 })
     .then(res => {
-        // allows to read all headers (even forbidden headers like set-cookies)
+        // allows to read all headers (even forbidden headers like set-cookie)
         const headers = JSON.parse(res.headers.get("cors-received-headers"));
-        console.log(headers);
+        console.log("Response headers:", headers);
         return res.json();
     })
     .then(console.log);
+```
 
+#### Using Legacy Format
+
+```javascript
 // Using the legacy format (still supported)
-fetch("https://test.cors.workers.dev/?https://httpbin.org/post", {
-    method: "post",
+fetch("https://your-worker.workers.dev/?https://httpbin.org/post", {
+    method: "POST",
     headers: {
-        "x-foo": "bar",
-        "x-bar": "foo"
-    }
+        "Content-Type": "application/json",
+        "x-foo": "bar"
+    },
+    body: JSON.stringify({ data: "test" })
+})
+    .then(res => res.json())
+    .then(console.log);
+```
+
+#### URL Without Protocol (Auto-prepends https://)
+
+```javascript
+// URL without protocol - automatically prepends https://
+fetch("https://your-worker.workers.dev/?url=api.example.com/data")
+    .then(res => res.json())
+    .then(console.log);
+// This is equivalent to: ?url=https://api.example.com/data
+```
+
+#### PUT/PATCH/DELETE Requests
+
+```javascript
+// PUT request
+fetch("https://your-worker.workers.dev/?url=https://api.example.com/resource/123", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "Updated Name" })
+})
+    .then(res => res.json())
+    .then(console.log);
+
+// DELETE request
+fetch("https://your-worker.workers.dev/?url=https://api.example.com/resource/123", {
+    method: "DELETE"
 })
     .then(res => res.json())
     .then(console.log);
@@ -299,10 +393,15 @@ fetch("https://test.cors.workers.dev/?https://httpbin.org/post", {
 
 ### Features
 
-- **Header Exposure**: All received headers are returned in the `cors-received-headers` header for easy access
-- **Custom Headers**: Use the `x-cors-headers` header to send custom headers (including forbidden headers like cookies)
-- **CORS Support**: Automatically handles CORS preflight (OPTIONS) requests
-- **Browser Fingerprint Rotation**: Automatically rotates between realistic browser fingerprints to reduce bot detection
+- **Header Exposure**: All received headers are returned in the `cors-received-headers` header for easy access (including forbidden headers like `set-cookie`)
+- **Custom Headers**: Use the `x-cors-headers` header to send custom headers (including forbidden headers like `Cookie`)
+- **CORS Support**: Automatically handles CORS preflight (OPTIONS) requests with 24-hour caching
+- **Browser Fingerprint Rotation**: Automatically rotates between realistic browser fingerprints (Chrome, Firefox, Safari) to reduce bot detection
+- **URL Auto-normalization**: Automatically prepends `https://` to URLs without a protocol
+- **URL Validation**: Validates and normalizes target URLs before making requests
+- **Request Body Forwarding**: Properly forwards request bodies for POST, PUT, PATCH, and other methods
+- **All HTTP Methods**: Supports GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS
+- **Preflight Caching**: Caches CORS preflight responses for 24 hours to reduce overhead
 
 ## Bot Detection & Limitations
 

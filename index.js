@@ -277,9 +277,6 @@ export default {
                     // If reconstructed looks like a URL, use it
                     if (reconstructed.match(/^https?:\/\//i)) {
                         targetUrl = reconstructed;
-                        console.log(
-                            `[${new Date().toISOString()}] 🔧 Reconstructed URL from query params: ${targetUrl}`
-                        );
                     }
                 }
 
@@ -318,16 +315,10 @@ export default {
 
         // Validate and normalize the target URL
         if (targetUrl) {
-            // Log the extracted URL for debugging
-            console.log(`[${new Date().toISOString()}] 🔍 Extracted target URL: ${targetUrl}`);
-
             // If targetUrl doesn't start with http:// or https://, automatically prepend https://
             if (!targetUrl.match(/^https?:\/\//i)) {
                 // Prepend https:// to URLs without a protocol
                 targetUrl = `https://${targetUrl}`;
-                console.log(
-                    `[${new Date().toISOString()}] 🔧 Auto-prepended https:// to URL: ${targetUrl}`
-                );
             }
 
             // Validate that it's a proper URL by trying to construct a URL object
@@ -335,11 +326,6 @@ export default {
                 const testUrl = new URL(targetUrl);
                 // Preserve the full URL including path, query, and hash
                 targetUrl = testUrl.href; // Normalize the URL to ensure it's properly formatted
-                console.log(
-                    `[${new Date().toISOString()}] ✅ Normalized target URL: ${targetUrl} (path: ${
-                        testUrl.pathname
-                    }, query: ${testUrl.search})`
-                );
             } catch (e) {
                 console.warn(
                     `[${new Date().toISOString()}] ⚠️  Invalid target URL format: ${targetUrl}, error: ${
@@ -604,8 +590,6 @@ export default {
             }
         } else if (!targetUrl) {
             // No target URL provided, show info page
-            console.log(`[${new Date().toISOString()}] ℹ️  Info page requested`);
-
             const responseHeaders = new Headers();
             setupCORSHeaders(responseHeaders);
 
