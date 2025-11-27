@@ -253,31 +253,64 @@ export default {
         if (!targetUrl && originUrl.search.startsWith("?")) {
             const searchString = originUrl.search.substring(1);
             if (searchString) {
-                // Handle URL-encoded URLs in the query string
-                // Try decoding - the URL might be single or double encoded
-                let decoded = searchString;
-                try {
-                    // First, try single decode
-                    decoded = decodeURIComponent(searchString);
-                    // If it still looks encoded (contains %), try decoding again
-                    if (decoded.includes("%")) {
-                        decoded = decodeURIComponent(decoded);
+                // Check if the query string has been parsed into multiple parameters
+                // (happens when URL contains unencoded : or / characters)
+                const paramKeys = Array.from(originUrl.searchParams.keys());
+
+                // If we have multiple keys and the first one looks like it might be part of a URL,
+                // try to reconstruct the URL from the parsed parameters
+                if (
+                    paramKeys.length > 1 ||
+                    (paramKeys.length === 1 && !searchString.includes("="))
+                ) {
+                    // Try to reconstruct URL from nested query params (e.g., "https://api": {"moonshot": {"ai/models": ""}})
+                    // This is a fallback - ideally URLs should be URL-encoded
+                    let reconstructed = "";
+                    for (const key of paramKeys) {
+                        if (reconstructed) reconstructed += "/";
+                        reconstructed += key;
+                        const value = originUrl.searchParams.get(key);
+                        if (value && value !== "") {
+                            reconstructed += "=" + value;
+                        }
                     }
-                    targetUrl = decoded;
-                } catch (e) {
-                    // If decode fails, try to use the string as-is if it looks like a URL
-                    if (
-                        searchString.match(/^https?%3A%2F%2F/i) ||
-                        searchString.match(/^https?:\/\//i)
-                    ) {
-                        // It looks like a URL, try one more time with just single decode
-                        try {
-                            targetUrl = decodeURIComponent(searchString);
-                        } catch (e2) {
+                    // If reconstructed looks like a URL, use it
+                    if (reconstructed.match(/^https?:\/\//i)) {
+                        targetUrl = reconstructed;
+                        console.log(
+                            `[${new Date().toISOString()}] 🔧 Reconstructed URL from query params: ${targetUrl}`
+                        );
+                    }
+                }
+
+                // If we haven't found a target URL yet, try the standard approach
+                if (!targetUrl) {
+                    // Handle URL-encoded URLs in the query string
+                    // Try decoding - the URL might be single or double encoded
+                    let decoded = searchString;
+                    try {
+                        // First, try single decode
+                        decoded = decodeURIComponent(searchString);
+                        // If it still looks encoded (contains %), try decoding again
+                        if (decoded.includes("%")) {
+                            decoded = decodeURIComponent(decoded);
+                        }
+                        targetUrl = decoded;
+                    } catch (e) {
+                        // If decode fails, try to use the string as-is if it looks like a URL
+                        if (
+                            searchString.match(/^https?%3A%2F%2F/i) ||
+                            searchString.match(/^https?:\/\//i)
+                        ) {
+                            // It looks like a URL, try one more time with just single decode
+                            try {
+                                targetUrl = decodeURIComponent(searchString);
+                            } catch (e2) {
+                                targetUrl = searchString;
+                            }
+                        } else {
                             targetUrl = searchString;
                         }
-                    } else {
-                        targetUrl = searchString;
                     }
                 }
             }
@@ -300,8 +333,13 @@ export default {
             // Validate that it's a proper URL by trying to construct a URL object
             try {
                 const testUrl = new URL(targetUrl);
+                // Preserve the full URL including path, query, and hash
                 targetUrl = testUrl.href; // Normalize the URL to ensure it's properly formatted
-                console.log(`[${new Date().toISOString()}] ✅ Normalized target URL: ${targetUrl}`);
+                console.log(
+                    `[${new Date().toISOString()}] ✅ Normalized target URL: ${targetUrl} (path: ${
+                        testUrl.pathname
+                    }, query: ${testUrl.search})`
+                );
             } catch (e) {
                 console.warn(
                     `[${new Date().toISOString()}] ⚠️  Invalid target URL format: ${targetUrl}, error: ${
@@ -520,11 +558,28 @@ export default {
                 const responseBody = isPreflightRequest ? null : await response.arrayBuffer();
                 const duration = Date.now() - startTime;
 
-                console.log(
-                    `[${new Date().toISOString()}] ✅ Success: ${targetUrl} | Status: ${
-                        response.status
-                    } | Duration: ${duration}ms | Method: ${request.method}`
-                );
+                // Log success or error based on status code
+                if (response.status >= 200 && response.status < 300) {
+                    console.log(
+                        `[${new Date().toISOString()}] ✅ Success: ${targetUrl} | Status: ${
+                            response.status
+                        } | Duration: ${duration}ms | Method: ${request.method}`
+                    );
+                } else if (response.status >= 400) {
+                    console.warn(
+                        `[${new Date().toISOString()}] ⚠️  HTTP Error: ${targetUrl} | Status: ${
+                            response.status
+                        } ${response.statusText} | Duration: ${duration}ms | Method: ${
+                            request.method
+                        }`
+                    );
+                } else {
+                    console.log(
+                        `[${new Date().toISOString()}] ℹ️  Response: ${targetUrl} | Status: ${
+                            response.status
+                        } | Duration: ${duration}ms | Method: ${request.method}`
+                    );
+                }
 
                 return new Response(responseBody, {
                     headers: responseHeaders,
@@ -554,18 +609,39 @@ export default {
             const responseHeaders = new Headers();
             setupCORSHeaders(responseHeaders);
 
+            // Format version timestamp - handle both ISO string and Unix timestamp
+            let deployedDate = null;
+            if (versionTimestamp) {
+                try {
+                    // If it's a string (ISO format), parse it directly
+                    // If it's a number (Unix timestamp in seconds), multiply by 1000
+                    if (typeof versionTimestamp === "string") {
+                        deployedDate = new Date(versionTimestamp).toISOString();
+                    } else if (typeof versionTimestamp === "number") {
+                        deployedDate = new Date(versionTimestamp * 1000).toISOString();
+                    }
+                } catch (e) {
+                    // If date parsing fails, skip the timestamp
+                    console.warn(
+                        `[${new Date().toISOString()}] ⚠️  Failed to parse version timestamp: ${versionTimestamp}`
+                    );
+                }
+            }
+
             const versionInfo = [
                 `Version: ${version}`,
                 ...(versionId ? [`Version ID: ${versionId}`] : []),
                 ...(versionTag ? [`Version Tag: ${versionTag}`] : []),
-                ...(versionTimestamp
-                    ? [`Deployed: ${new Date(versionTimestamp * 1000).toISOString()}`]
-                    : [])
+                ...(deployedDate ? [`Deployed: ${deployedDate}`] : [])
             ];
 
             const infoText = [
                 "CLOUDFLARE-CORS-ANYWHERE",
                 ...versionInfo,
+                "",
+                "Author:",
+                "rozx (https://github.com/rozx)",
+                "Zibri (https://github.com/Zibri)",
                 "",
                 "Source:",
                 "https://github.com/rozx/cloudflare-cors-anywhere",
