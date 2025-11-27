@@ -16,10 +16,70 @@ The script is configurable with whitelist and blacklist patterns, although the b
 The main goal is to facilitate cross-origin requests while enforcing specific security and rate-limiting policies.
 */
 
+// Import version from package.json (auto-generated file)
+import { VERSION as PACKAGE_VERSION } from "./version.js";
+
 // Configuration: Default values (used as fallback if env vars are unavailable)
 const DEFAULT_BLACKLIST_URLS = []; // regexp for blacklisted urls
 const DEFAULT_WHITELIST_ORIGINS = [".*"]; // regexp for whitelisted origins
-const VERSION = "1.2.0"; // Version ID
+const DEFAULT_VERSION = PACKAGE_VERSION; // Version from package.json (auto-generated)
+
+/**
+ * Get version metadata from Cloudflare Version Metadata binding or environment variable or default
+ *
+ * Priority order:
+ * 1. Cloudflare Version Metadata (env.CF_VERSION_METADATA) - automatically provided by Cloudflare
+ * 2. Custom VERSION env var (set via wrangler.toml [vars] or wrangler secret put VERSION)
+ * 3. DEPLOYMENT_VERSION env var (alternative custom version)
+ * 4. Default version (fallback)
+ *
+ * Version Metadata provides:
+ * - id: Unique version identifier
+ * - tag: Optional version tag
+ * - timestamp: Version creation timestamp
+ *
+ * Returns an object with { version, versionId, versionTag, versionTimestamp }
+ */
+function getVersionMetadata(env) {
+    // Try Cloudflare's built-in Version Metadata binding first
+    // Note: Version Metadata is only populated in certain deployment scenarios
+    // and may have empty id/tag if not using Workers Versions API
+    if (env?.CF_VERSION_METADATA) {
+        try {
+            const { id, tag, timestamp } = env.CF_VERSION_METADATA;
+
+            // Only use if id or tag are non-empty strings
+            const versionId = id && id.trim() ? id : null;
+            const versionTag = tag && tag.trim() ? tag : null;
+            const versionTimestamp =
+                timestamp && timestamp !== "0001-01-01T00:00:00Z" && timestamp.trim()
+                    ? timestamp
+                    : null;
+
+            if (versionId || versionTag) {
+                return {
+                    version: versionTag || versionId,
+                    versionId,
+                    versionTag,
+                    versionTimestamp
+                };
+            }
+        } catch (e) {
+            // Silently fall through to environment variables
+        }
+    }
+
+    // Use environment variables (more reliable and commonly used)
+    // Set via wrangler.toml [vars] or wrangler secret put VERSION
+    // Or during deployment: wrangler deploy --var VERSION:$(git rev-parse --short HEAD)
+    const version = env?.VERSION || env?.DEPLOYMENT_VERSION || DEFAULT_VERSION;
+    return {
+        version,
+        versionId: null,
+        versionTag: null,
+        versionTimestamp: null
+    };
+}
 
 /**
  * Get configuration from Cloudflare Secrets or environment variables, with fallback to defaults
@@ -27,6 +87,11 @@ const VERSION = "1.2.0"; // Version ID
  * Configuration values should be JSON arrays:
  * - BLACKLIST_URLS: JSON array of regex patterns for blacklisted URLs
  * - WHITELIST_ORIGINS: JSON array of regex patterns for whitelisted origins
+ *
+ * Priority order (highest to lowest):
+ * 1. Direct secrets (env.BLACKLIST_URLS) - set via wrangler secret put
+ * 2. Environment variables (env.BLACKLIST_URLS) - from wrangler.toml [vars]
+ * 3. Default values
  *
  * Setup using Cloudflare Secrets (recommended for security):
  *   wrangler secret put BLACKLIST_URLS
@@ -106,393 +171,445 @@ function isListedInWhitelist(uri, listing) {
     return true;
 }
 
-// Event listener for incoming fetch requests
-addEventListener("fetch", async event => {
-    event.respondWith(
-        (async function() {
-            const startTime = Date.now();
-            const isPreflightRequest = event.request.method === "OPTIONS";
+// Module worker export - handles all incoming fetch requests
+export default {
+    async fetch(request, env, ctx) {
+        const startTime = Date.now();
+        const isPreflightRequest = request.method === "OPTIONS";
 
-            const originUrl = new URL(event.request.url);
+        const originUrl = new URL(request.url);
 
-            // Load configuration from environment variables (with fallback to defaults)
-            const config = getConfig(event.env);
+        // Load configuration from environment variables (with fallback to defaults)
+        const config = getConfig(env);
+        const versionMeta = getVersionMetadata(env);
+        const { version, versionId, versionTag, versionTimestamp } = versionMeta;
 
-            // Log incoming request
-            const originHeader = event.request.headers.get("Origin");
-            const connectingIp = event.request.headers.get("CF-Connecting-IP");
-            const country = event.request.cf?.country;
-            const colo = event.request.cf?.colo;
+        // Log incoming request
+        const originHeader = request.headers.get("Origin");
+        const connectingIp = request.headers.get("CF-Connecting-IP");
+        const country = request.cf?.country;
+        const colo = request.cf?.colo;
 
-            console.log(
-                `[${new Date().toISOString()}] ${event.request.method} ${originUrl.pathname}${
-                    originUrl.search
-                } | Origin: ${originHeader || "none"} | IP: ${connectingIp ||
-                    "unknown"} | Country: ${country || "unknown"} | Colo: ${colo || "unknown"}`
-            );
+        // Build version info string for logging
+        const versionInfo = versionId
+            ? `Version: ${version} (id: ${versionId}${versionTag ? `, tag: ${versionTag}` : ""}${
+                  versionTimestamp ? `, ts: ${versionTimestamp}` : ""
+              })`
+            : `Version: ${version}`;
 
-            // Function to modify headers to enable CORS
-            const setupCORSHeaders = headers => {
-                const origin = event.request.headers.get("Origin");
-                if (origin) {
-                    // Use the specific origin (not *) to allow credentials
-                    headers.set("Access-Control-Allow-Origin", origin);
-                    // Allow credentials when a specific origin is present
-                    // Note: Credentials can only be used with specific origins, not "*"
-                    headers.set("Access-Control-Allow-Credentials", "true");
+        console.log(
+            `[${new Date().toISOString()}] ${request.method} ${originUrl.pathname}${
+                originUrl.search
+            } | Origin: ${originHeader || "none"} | IP: ${connectingIp ||
+                "unknown"} | Country: ${country || "unknown"} | Colo: ${colo ||
+                "unknown"} | ${versionInfo}`
+        );
+
+        // Function to modify headers to enable CORS
+        const setupCORSHeaders = headers => {
+            const origin = request.headers.get("Origin");
+            if (origin) {
+                // Use the specific origin (not *) to allow credentials
+                headers.set("Access-Control-Allow-Origin", origin);
+                // Allow credentials when a specific origin is present
+                // Note: Credentials can only be used with specific origins, not "*"
+                headers.set("Access-Control-Allow-Credentials", "true");
+            } else {
+                // No origin header - could be same-origin request or missing header
+                // For same-origin requests, CORS headers aren't strictly necessary,
+                // but we set them anyway for consistency
+                headers.set("Access-Control-Allow-Origin", "*");
+                // Cannot use credentials with wildcard origin per CORS spec
+            }
+
+            if (isPreflightRequest) {
+                const requestMethod = request.headers.get("access-control-request-method");
+                // Support all common HTTP methods
+                const allowedMethods = requestMethod
+                    ? requestMethod
+                    : "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS";
+                headers.set("Access-Control-Allow-Methods", allowedMethods);
+
+                const requestedHeaders = request.headers.get("access-control-request-headers");
+                if (requestedHeaders) {
+                    headers.set("Access-Control-Allow-Headers", requestedHeaders);
                 } else {
-                    // No origin header - could be same-origin request or missing header
-                    // For same-origin requests, CORS headers aren't strictly necessary,
-                    // but we set them anyway for consistency
-                    headers.set("Access-Control-Allow-Origin", "*");
-                    // Cannot use credentials with wildcard origin per CORS spec
+                    // Allow common headers if none specified
+                    headers.set(
+                        "Access-Control-Allow-Headers",
+                        "Content-Type, Authorization, X-Requested-With, Accept, Origin"
+                    );
                 }
 
-                if (isPreflightRequest) {
-                    const requestMethod = event.request.headers.get(
-                        "access-control-request-method"
-                    );
-                    // Support all common HTTP methods
-                    const allowedMethods = requestMethod
-                        ? requestMethod
-                        : "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS";
-                    headers.set("Access-Control-Allow-Methods", allowedMethods);
+                headers.delete("X-Content-Type-Options"); // Remove X-Content-Type-Options header
+            }
+            return headers;
+        };
 
-                    const requestedHeaders = event.request.headers.get(
-                        "access-control-request-headers"
-                    );
-                    if (requestedHeaders) {
-                        headers.set("Access-Control-Allow-Headers", requestedHeaders);
-                    } else {
-                        // Allow common headers if none specified
-                        headers.set(
-                            "Access-Control-Allow-Headers",
-                            "Content-Type, Authorization, X-Requested-With, Accept, Origin"
-                        );
+        // Extract target URL - support both ?url={targetUrl} and ?{targetUrl} formats
+        let targetUrl = originUrl.searchParams.get("url");
+
+        // If no 'url' parameter, fall back to old format (everything after ?)
+        if (!targetUrl && originUrl.search.startsWith("?")) {
+            const searchString = originUrl.search.substring(1);
+            if (searchString) {
+                // Handle URL-encoded URLs in the query string
+                // Try decoding - the URL might be single or double encoded
+                let decoded = searchString;
+                try {
+                    // First, try single decode
+                    decoded = decodeURIComponent(searchString);
+                    // If it still looks encoded (contains %), try decoding again
+                    if (decoded.includes("%")) {
+                        decoded = decodeURIComponent(decoded);
                     }
-
-                    headers.delete("X-Content-Type-Options"); // Remove X-Content-Type-Options header
-                }
-                return headers;
-            };
-
-            // Extract target URL - support both ?url={targetUrl} and ?{targetUrl} formats
-            let targetUrl = originUrl.searchParams.get("url");
-
-            // If no 'url' parameter, fall back to old format (everything after ?)
-            if (!targetUrl && originUrl.search.startsWith("?")) {
-                const searchString = originUrl.search.substring(1);
-                if (searchString) {
-                    try {
-                        // Old format may be double-encoded, try decoding twice
-                        targetUrl = decodeURIComponent(decodeURIComponent(searchString));
-                    } catch (e) {
-                        // If double decode fails, try single decode
+                    targetUrl = decoded;
+                } catch (e) {
+                    // If decode fails, try to use the string as-is if it looks like a URL
+                    if (
+                        searchString.match(/^https?%3A%2F%2F/i) ||
+                        searchString.match(/^https?:\/\//i)
+                    ) {
+                        // It looks like a URL, try one more time with just single decode
                         try {
                             targetUrl = decodeURIComponent(searchString);
                         } catch (e2) {
-                            // If that also fails, use as-is
                             targetUrl = searchString;
                         }
+                    } else {
+                        targetUrl = searchString;
                     }
                 }
             }
+        }
 
-            // Parse custom headers (used in both proxy and info page)
-            let customHeaders = event.request.headers.get("x-cors-headers");
-            if (customHeaders !== null) {
-                try {
-                    customHeaders = JSON.parse(customHeaders);
-                } catch (e) {}
+        // Validate and normalize the target URL
+        if (targetUrl) {
+            // Log the extracted URL for debugging
+            console.log(`[${new Date().toISOString()}] 🔍 Extracted target URL: ${targetUrl}`);
+
+            // If targetUrl doesn't start with http:// or https://, automatically prepend https://
+            if (!targetUrl.match(/^https?:\/\//i)) {
+                // Prepend https:// to URLs without a protocol
+                targetUrl = `https://${targetUrl}`;
+                console.log(
+                    `[${new Date().toISOString()}] 🔧 Auto-prepended https:// to URL: ${targetUrl}`
+                );
             }
 
-            // Handle OPTIONS preflight requests early - don't forward to target URL
-            if (isPreflightRequest) {
-                // Validate origin and target URL exist
-                if (
-                    targetUrl &&
-                    !isListedInWhitelist(targetUrl, config.blacklistUrls) &&
-                    isListedInWhitelist(originHeader, config.whitelistOrigins)
-                ) {
-                    const preflightHeaders = new Headers();
-                    setupCORSHeaders(preflightHeaders);
-
-                    // Add Access-Control-Max-Age for preflight caching (24 hours)
-                    // This allows browsers to cache the preflight response and avoid repeated OPTIONS requests
-                    preflightHeaders.set("Access-Control-Max-Age", "86400");
-
-                    console.log(
-                        `[${new Date().toISOString()}] ✅ Preflight handled: ${targetUrl} | Origin: ${originHeader ||
-                            "none"}`
-                    );
-
-                    return new Response(null, {
-                        status: 200,
-                        statusText: "OK",
-                        headers: preflightHeaders
-                    });
-                } else {
-                    // Invalid preflight - still return CORS headers but with error status
-                    const errorHeaders = new Headers();
-                    setupCORSHeaders(errorHeaders);
-
-                    console.warn(
-                        `[${new Date().toISOString()}] ⚠️  Preflight blocked: URL not whitelisted or origin not allowed | Target: ${targetUrl ||
-                            "none"} | Origin: ${originHeader || "none"}`
-                    );
-
-                    return new Response(null, {
-                        status: 403,
-                        statusText: "Forbidden",
-                        headers: errorHeaders
-                    });
-                }
+            // Validate that it's a proper URL by trying to construct a URL object
+            try {
+                const testUrl = new URL(targetUrl);
+                targetUrl = testUrl.href; // Normalize the URL to ensure it's properly formatted
+                console.log(`[${new Date().toISOString()}] ✅ Normalized target URL: ${targetUrl}`);
+            } catch (e) {
+                console.warn(
+                    `[${new Date().toISOString()}] ⚠️  Invalid target URL format: ${targetUrl}, error: ${
+                        e.message
+                    }`
+                );
+                targetUrl = null; // Mark as invalid
             }
+        }
 
+        // Parse custom headers (used in both proxy and info page)
+        let customHeaders = request.headers.get("x-cors-headers");
+        if (customHeaders !== null) {
+            try {
+                customHeaders = JSON.parse(customHeaders);
+            } catch (e) {}
+        }
+
+        // Handle OPTIONS preflight requests early - don't forward to target URL
+        if (isPreflightRequest) {
+            // Validate origin and target URL exist
             if (
                 targetUrl &&
                 !isListedInWhitelist(targetUrl, config.blacklistUrls) &&
                 isListedInWhitelist(originHeader, config.whitelistOrigins)
             ) {
-                // Fetch the target URL
-                const filteredHeaders = {};
-                const excludePatterns = [
-                    /^origin/i,
-                    /^referer/i,
-                    /^cf-/,
-                    /^x-forw/i,
-                    /^x-cors-headers/i
-                ];
+                const preflightHeaders = new Headers();
+                setupCORSHeaders(preflightHeaders);
 
-                // Determine Sec-Fetch-Site based on origin
-                const secFetchSite = originHeader ? "cross-site" : "none";
+                // Add Access-Control-Max-Age for preflight caching (24 hours)
+                // This allows browsers to cache the preflight response and avoid repeated OPTIONS requests
+                preflightHeaders.set("Access-Control-Max-Age", "86400");
 
-                // Generate a realistic referer (use a common search engine or the origin)
-                const referer = originHeader || "https://www.google.com/";
+                console.log(
+                    `[${new Date().toISOString()}] ✅ Preflight handled: ${targetUrl} | Origin: ${originHeader ||
+                        "none"}`
+                );
 
-                // Multiple realistic browser fingerprints to rotate through
-                const browserFingerprints = [
-                    {
-                        // Chrome on Windows
-                        "User-Agent":
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                        Accept:
-                            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                        "Accept-Language": "en-US,en;q=0.9",
-                        "Accept-Encoding": "gzip, deflate, br",
-                        Referer: referer,
-                        "Sec-Ch-Ua":
-                            '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-                        "Sec-Ch-Ua-Mobile": "?0",
-                        "Sec-Ch-Ua-Platform": '"Windows"',
-                        "Sec-Ch-Ua-Platform-Version": '"15.0.0"',
-                        "Sec-Fetch-Dest": "document",
-                        "Sec-Fetch-Mode": "navigate",
-                        "Sec-Fetch-Site": secFetchSite,
-                        "Sec-Fetch-User": "?1",
-                        "Upgrade-Insecure-Requests": "1",
-                        "Cache-Control": "max-age=0"
-                    },
-                    {
-                        // Chrome on macOS
-                        "User-Agent":
-                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                        Accept:
-                            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                        "Accept-Language": "en-US,en;q=0.9",
-                        "Accept-Encoding": "gzip, deflate, br",
-                        Referer: referer,
-                        "Sec-Ch-Ua":
-                            '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-                        "Sec-Ch-Ua-Mobile": "?0",
-                        "Sec-Ch-Ua-Platform": '"macOS"',
-                        "Sec-Ch-Ua-Platform-Version": '"15.0.0"',
-                        "Sec-Fetch-Dest": "document",
-                        "Sec-Fetch-Mode": "navigate",
-                        "Sec-Fetch-Site": secFetchSite,
-                        "Sec-Fetch-User": "?1",
-                        "Upgrade-Insecure-Requests": "1",
-                        "Cache-Control": "max-age=0"
-                    },
-                    {
-                        // Firefox on Windows
-                        "User-Agent":
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-                        Accept:
-                            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                        "Accept-Language": "en-US,en;q=0.5",
-                        "Accept-Encoding": "gzip, deflate, br",
-                        Referer: referer,
-                        DNT: "1",
-                        Connection: "keep-alive",
-                        "Upgrade-Insecure-Requests": "1",
-                        "Sec-Fetch-Dest": "document",
-                        "Sec-Fetch-Mode": "navigate",
-                        "Sec-Fetch-Site": secFetchSite,
-                        "Sec-Fetch-User": "?1",
-                        "Cache-Control": "max-age=0"
-                    },
-                    {
-                        // Safari on macOS
-                        "User-Agent":
-                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-                        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language": "en-US,en;q=0.9",
-                        "Accept-Encoding": "gzip, deflate, br",
-                        Referer: referer,
-                        DNT: "1",
-                        Connection: "keep-alive",
-                        "Upgrade-Insecure-Requests": "1",
-                        "Sec-Fetch-Dest": "document",
-                        "Sec-Fetch-Mode": "navigate",
-                        "Sec-Fetch-Site": secFetchSite,
-                        "Sec-Fetch-User": "?1",
-                        "Cache-Control": "max-age=0"
-                    }
-                ];
-
-                // Randomly select a browser fingerprint (or use hash of target URL for consistency)
-                const fingerprintIndex =
-                    Math.abs(
-                        targetUrl.split("").reduce((hash, char) => {
-                            return (hash << 5) - hash + char.charCodeAt(0);
-                        }, 0)
-                    ) % browserFingerprints.length;
-
-                const defaultBrowserHeaders = browserFingerprints[fingerprintIndex];
-
-                // Start with default browser headers
-                Object.assign(filteredHeaders, defaultBrowserHeaders);
-
-                // Override with headers from the original request (except excluded ones)
-                for (const [key, value] of event.request.headers.entries()) {
-                    if (!excludePatterns.some(pattern => pattern.test(key))) {
-                        filteredHeaders[key] = value;
-                    }
-                }
-
-                // Custom headers override everything
-                if (customHeaders !== null && typeof customHeaders === "object") {
-                    Object.assign(filteredHeaders, customHeaders);
-                }
-
-                // Create new request with explicit method, body, and URL to ensure all HTTP methods work
-                // This preserves the original request method (GET, POST, PUT, DELETE, PATCH, etc.)
-                // and forwards the body for methods that need it
-                const requestMethod = event.request.method;
-
-                // Create a new request copying all properties from the original request
-                // but with the target URL and filtered headers
-                const newRequest = new Request(targetUrl, {
-                    method: requestMethod,
-                    headers: filteredHeaders,
-                    body: event.request.body, // Request constructor handles body appropriately
-                    redirect: "follow"
-                });
-
-                try {
-                    console.log(
-                        `[${new Date().toISOString()}] Fetching target URL: ${targetUrl} | Method: ${requestMethod}`
-                    );
-                    const response = await fetch(targetUrl, newRequest);
-                    const responseHeaders = new Headers(response.headers);
-                    const exposedHeaders = Array.from(response.headers.keys());
-                    const allResponseHeaders = Object.fromEntries(response.headers.entries());
-
-                    exposedHeaders.push("cors-received-headers");
-                    setupCORSHeaders(responseHeaders);
-
-                    responseHeaders.set("Access-Control-Expose-Headers", exposedHeaders.join(","));
-                    responseHeaders.set(
-                        "cors-received-headers",
-                        JSON.stringify(allResponseHeaders)
-                    );
-
-                    const responseBody = isPreflightRequest ? null : await response.arrayBuffer();
-                    const duration = Date.now() - startTime;
-
-                    console.log(
-                        `[${new Date().toISOString()}] ✅ Success: ${targetUrl} | Status: ${
-                            response.status
-                        } | Duration: ${duration}ms | Method: ${event.request.method}`
-                    );
-
-                    return new Response(responseBody, {
-                        headers: responseHeaders,
-                        status: isPreflightRequest ? 200 : response.status,
-                        statusText: isPreflightRequest ? "OK" : response.statusText
-                    });
-                } catch (error) {
-                    const duration = Date.now() - startTime;
-                    console.error(
-                        `[${new Date().toISOString()}] ❌ Error fetching ${targetUrl}: ${
-                            error.message
-                        } | Duration: ${duration}ms | Stack: ${error.stack}`
-                    );
-
-                    const errorHeaders = new Headers();
-                    setupCORSHeaders(errorHeaders);
-                    return new Response(`Error fetching target URL: ${error.message}`, {
-                        status: 502,
-                        statusText: "Bad Gateway",
-                        headers: errorHeaders
-                    });
-                }
-            } else if (!targetUrl) {
-                // No target URL provided, show info page
-                console.log(`[${new Date().toISOString()}] ℹ️  Info page requested`);
-
-                const responseHeaders = new Headers();
-                setupCORSHeaders(responseHeaders);
-
-                const infoText = [
-                    "CLOUDFLARE-CORS-ANYWHERE",
-                    `Version: ${VERSION}`,
-                    "",
-                    "Source:",
-                    "https://github.com/rozx/cloudflare-cors-anywhere",
-                    "",
-                    "Usage:",
-                    `${originUrl.origin}/?url={targetUrl}`,
-                    `or: ${originUrl.origin}/?{targetUrl}`,
-                    "",
-                    "Limits: 100,000 requests/day",
-                    "          1,000 requests/10 minutes",
-                    "",
-                    ...(originHeader ? [`Origin: ${originHeader}`] : []),
-                    `IP: ${connectingIp || "unknown"}`,
-                    ...(country ? [`Country: ${country}`] : []),
-                    ...(colo ? [`Datacenter: ${colo}`] : []),
-                    "",
-                    ...(customHeaders !== null
-                        ? [`x-cors-headers: ${JSON.stringify(customHeaders)}`]
-                        : [])
-                ].join("\n");
-
-                return new Response(infoText, {
+                return new Response(null, {
                     status: 200,
-                    headers: responseHeaders
+                    statusText: "OK",
+                    headers: preflightHeaders
                 });
             } else {
+                // Invalid preflight - still return CORS headers but with error status
+                const errorHeaders = new Headers();
+                setupCORSHeaders(errorHeaders);
+
                 console.warn(
-                    `[${new Date().toISOString()}] ⚠️  Request blocked: URL not whitelisted or origin not allowed | Target: ${targetUrl} | Origin: ${originHeader ||
-                        "none"}`
+                    `[${new Date().toISOString()}] ⚠️  Preflight blocked: URL not whitelisted or origin not allowed | Target: ${targetUrl ||
+                        "none"} | Origin: ${originHeader || "none"}`
+                );
+
+                return new Response(null, {
+                    status: 403,
+                    statusText: "Forbidden",
+                    headers: errorHeaders
+                });
+            }
+        }
+
+        if (
+            targetUrl &&
+            !isListedInWhitelist(targetUrl, config.blacklistUrls) &&
+            isListedInWhitelist(originHeader, config.whitelistOrigins)
+        ) {
+            // Fetch the target URL
+            const filteredHeaders = {};
+            const excludePatterns = [
+                /^origin/i,
+                /^referer/i,
+                /^cf-/,
+                /^x-forw/i,
+                /^x-cors-headers/i
+            ];
+
+            // Determine Sec-Fetch-Site based on origin
+            const secFetchSite = originHeader ? "cross-site" : "none";
+
+            // Generate a realistic referer (use a common search engine or the origin)
+            const referer = originHeader || "https://www.google.com/";
+
+            // Multiple realistic browser fingerprints to rotate through
+            const browserFingerprints = [
+                {
+                    // Chrome on Windows
+                    "User-Agent":
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    Accept:
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    Referer: referer,
+                    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                    "Sec-Ch-Ua-Mobile": "?0",
+                    "Sec-Ch-Ua-Platform": '"Windows"',
+                    "Sec-Ch-Ua-Platform-Version": '"15.0.0"',
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": secFetchSite,
+                    "Sec-Fetch-User": "?1",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Cache-Control": "max-age=0"
+                },
+                {
+                    // Chrome on macOS
+                    "User-Agent":
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    Accept:
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    Referer: referer,
+                    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                    "Sec-Ch-Ua-Mobile": "?0",
+                    "Sec-Ch-Ua-Platform": '"macOS"',
+                    "Sec-Ch-Ua-Platform-Version": '"15.0.0"',
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": secFetchSite,
+                    "Sec-Fetch-User": "?1",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Cache-Control": "max-age=0"
+                },
+                {
+                    // Firefox on Windows
+                    "User-Agent":
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+                    Accept:
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.5",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    Referer: referer,
+                    DNT: "1",
+                    Connection: "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": secFetchSite,
+                    "Sec-Fetch-User": "?1",
+                    "Cache-Control": "max-age=0"
+                },
+                {
+                    // Safari on macOS
+                    "User-Agent":
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+                    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    Referer: referer,
+                    DNT: "1",
+                    Connection: "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": secFetchSite,
+                    "Sec-Fetch-User": "?1",
+                    "Cache-Control": "max-age=0"
+                }
+            ];
+
+            // Randomly select a browser fingerprint (or use hash of target URL for consistency)
+            const fingerprintIndex =
+                Math.abs(
+                    targetUrl.split("").reduce((hash, char) => {
+                        return (hash << 5) - hash + char.charCodeAt(0);
+                    }, 0)
+                ) % browserFingerprints.length;
+
+            const defaultBrowserHeaders = browserFingerprints[fingerprintIndex];
+
+            // Start with default browser headers
+            Object.assign(filteredHeaders, defaultBrowserHeaders);
+
+            // Override with headers from the original request (except excluded ones)
+            for (const [key, value] of request.headers.entries()) {
+                if (!excludePatterns.some(pattern => pattern.test(key))) {
+                    filteredHeaders[key] = value;
+                }
+            }
+
+            // Custom headers override everything
+            if (customHeaders !== null && typeof customHeaders === "object") {
+                Object.assign(filteredHeaders, customHeaders);
+            }
+
+            // Create new request with explicit method, body, and URL to ensure all HTTP methods work
+            // This preserves the original request method (GET, POST, PUT, DELETE, PATCH, etc.)
+            // and forwards the body for methods that need it
+            const requestMethod = request.method;
+
+            // Create a new request copying all properties from the original request
+            // but with the target URL and filtered headers
+            const newRequest = new Request(targetUrl, {
+                method: requestMethod,
+                headers: filteredHeaders,
+                body: request.body, // Request constructor handles body appropriately
+                redirect: "follow"
+            });
+
+            try {
+                console.log(
+                    `[${new Date().toISOString()}] Fetching target URL: ${targetUrl} | Method: ${requestMethod}`
+                );
+                const response = await fetch(targetUrl, newRequest);
+                const responseHeaders = new Headers(response.headers);
+                const exposedHeaders = Array.from(response.headers.keys());
+                const allResponseHeaders = Object.fromEntries(response.headers.entries());
+
+                exposedHeaders.push("cors-received-headers");
+                setupCORSHeaders(responseHeaders);
+
+                responseHeaders.set("Access-Control-Expose-Headers", exposedHeaders.join(","));
+                responseHeaders.set("cors-received-headers", JSON.stringify(allResponseHeaders));
+
+                const responseBody = isPreflightRequest ? null : await response.arrayBuffer();
+                const duration = Date.now() - startTime;
+
+                console.log(
+                    `[${new Date().toISOString()}] ✅ Success: ${targetUrl} | Status: ${
+                        response.status
+                    } | Duration: ${duration}ms | Method: ${request.method}`
+                );
+
+                return new Response(responseBody, {
+                    headers: responseHeaders,
+                    status: isPreflightRequest ? 200 : response.status,
+                    statusText: isPreflightRequest ? "OK" : response.statusText
+                });
+            } catch (error) {
+                const duration = Date.now() - startTime;
+                console.error(
+                    `[${new Date().toISOString()}] ❌ Error fetching ${targetUrl}: ${
+                        error.message
+                    } | Duration: ${duration}ms | Stack: ${error.stack}`
                 );
 
                 const errorHeaders = new Headers();
                 setupCORSHeaders(errorHeaders);
-                errorHeaders.set("Content-Type", "text/html");
-
-                return new Response(
-                    "Create your own CORS proxy</br>\n" +
-                        "<a href='https://github.com/rozx/cloudflare-cors-anywhere'>https://github.com/rozx/cloudflare-cors-anywhere</a></br>\n",
-                    {
-                        status: 403,
-                        statusText: "Forbidden",
-                        headers: errorHeaders
-                    }
-                );
+                return new Response(`Error fetching target URL: ${error.message}`, {
+                    status: 502,
+                    statusText: "Bad Gateway",
+                    headers: errorHeaders
+                });
             }
-        })()
-    );
-});
+        } else if (!targetUrl) {
+            // No target URL provided, show info page
+            console.log(`[${new Date().toISOString()}] ℹ️  Info page requested`);
+
+            const responseHeaders = new Headers();
+            setupCORSHeaders(responseHeaders);
+
+            const versionInfo = [
+                `Version: ${version}`,
+                ...(versionId ? [`Version ID: ${versionId}`] : []),
+                ...(versionTag ? [`Version Tag: ${versionTag}`] : []),
+                ...(versionTimestamp
+                    ? [`Deployed: ${new Date(versionTimestamp * 1000).toISOString()}`]
+                    : [])
+            ];
+
+            const infoText = [
+                "CLOUDFLARE-CORS-ANYWHERE",
+                ...versionInfo,
+                "",
+                "Source:",
+                "https://github.com/rozx/cloudflare-cors-anywhere",
+                "",
+                "Usage:",
+                `${originUrl.origin}/?url={targetUrl}`,
+                `or: ${originUrl.origin}/?{targetUrl}`,
+                "",
+                "Limits: 100,000 requests/day",
+                "          1,000 requests/10 minutes",
+                "",
+                ...(originHeader ? [`Origin: ${originHeader}`] : []),
+                `IP: ${connectingIp || "unknown"}`,
+                ...(country ? [`Country: ${country}`] : []),
+                ...(colo ? [`Datacenter: ${colo}`] : []),
+                "",
+                ...(customHeaders !== null
+                    ? [`x-cors-headers: ${JSON.stringify(customHeaders)}`]
+                    : [])
+            ].join("\n");
+
+            return new Response(infoText, {
+                status: 200,
+                headers: responseHeaders
+            });
+        } else {
+            console.warn(
+                `[${new Date().toISOString()}] ⚠️  Request blocked: URL not whitelisted or origin not allowed | Target: ${targetUrl} | Origin: ${originHeader ||
+                    "none"}`
+            );
+
+            const errorHeaders = new Headers();
+            setupCORSHeaders(errorHeaders);
+            errorHeaders.set("Content-Type", "text/html");
+
+            return new Response(
+                "Create your own CORS proxy</br>\n" +
+                    "<a href='https://github.com/rozx/cloudflare-cors-anywhere'>https://github.com/rozx/cloudflare-cors-anywhere</a></br>\n",
+                {
+                    status: 403,
+                    statusText: "Forbidden",
+                    headers: errorHeaders
+                }
+            );
+        }
+    }
+};
