@@ -107,6 +107,14 @@ wrangler secret put BLACKLIST_URLS
 # Set whitelist origins (JSON array of regex patterns)
 wrangler secret put WHITELIST_ORIGINS
 # When prompted, paste: ["^https://example\\.com$", "^https://.*\\.example\\.com$"]
+
+# Set backup CORS servers (JSON array of backup proxy URLs)
+wrangler secret put BACKUP_CORS_SERVERS
+# When prompted, paste: ["https://backup-1.workers.dev", "https://backup-2.workers.dev"]
+
+# Set retry attempts after first try (non-negative integer)
+wrangler secret put MAX_RETRY_ATTEMPTS
+# When prompted, paste: 3
 ```
 
 **View/Update Secrets:**
@@ -132,6 +140,24 @@ wrangler secret delete BLACKLIST_URLS
   - Example: `["^https://myapp\\.com$", "^https://.*\\.myapp\\.com$"]`
   - Default: `[".*"]` (all origins allowed)
 
+- **BACKUP_CORS_SERVERS**: JSON array of backup CORS proxy server URLs
+  - Format: backup URL template must include `{url}` placeholder
+  - Example: `"https://backup.server.com/?url={url}"`
+  - Also supports URL-encoded placeholder form: `%7Burl%7D`
+  - Runtime behavior: worker replaces `{url}` with the actual target URL
+  - Accepted input formats:
+    - JSON array (recommended): `["https://a/?url={url}","https://b/?url={url}"]`
+    - Quoted list: `"https://a/?url={url}","https://b/?url={url}"`
+    - Comma/newline-separated URLs
+  - Smart routing: when a backup server succeeds, worker stores it in KV for 15 minutes per target URL and prioritizes it first during that window
+  - Used when direct destination fetch fails or returns retryable status (all `4xx` + `502`/`503`)
+  - Default: `[]` (disabled)
+  - Legacy compatibility: `DEFAULT_BACKUP_CORS_SERVERS` is also accepted, but deprecated
+
+- **MAX_RETRY_ATTEMPTS**: Non-negative integer for retry count after the first direct attempt
+  - Example: `3`
+  - Default: `3`
+
 **Alternative: Environment Variables (wrangler.toml)**
 
 For non-sensitive configuration, you can use the `[vars]` section in `wrangler.toml`:
@@ -140,6 +166,15 @@ For non-sensitive configuration, you can use the `[vars]` section in `wrangler.t
 [vars]
 BLACKLIST_URLS = '["^https?://malicious\\.com"]'
 WHITELIST_ORIGINS = '["^https://example\\.com$"]'
+BACKUP_CORS_SERVERS = '["https://backup-1.workers.dev", "https://backup-2.workers.dev"]'
+MAX_RETRY_ATTEMPTS = '3'
+```
+
+Also add a KV namespace binding (required for preferred-backup cache):
+
+```toml
+[[kv_namespaces]]
+binding = "BACKUP_SERVER_CACHE"
 ```
 
 **Note:** Secrets take precedence over `[vars]` if both are set.
@@ -400,6 +435,9 @@ fetch("https://your-worker.workers.dev/?url=https://api.example.com/resource/123
 - **URL Auto-normalization**: Automatically prepends `https://` to URLs without a protocol
 - **URL Validation**: Validates and normalizes target URLs before making requests
 - **Request Body Forwarding**: Properly forwards request bodies for POST, PUT, PATCH, and other methods
+- **Backup CORS Failover**: Retries with backup CORS servers when direct requests fail or return retryable status (all `4xx` + `502`/`503`)
+- **Backup Security Guard**: If request contains sensitive headers (e.g. `Authorization`, `Cookie`, `X-API-Key`), backup proxy path is blocked and returns `403`
+  - Override: append `?allowSensitive=true` to allow backup usage even when sensitive headers exist
 - **All HTTP Methods**: Supports GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS
 - **Preflight Caching**: Caches CORS preflight responses for 24 hours to reduce overhead
 

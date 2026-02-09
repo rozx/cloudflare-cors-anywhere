@@ -22,7 +22,12 @@ import { VERSION as PACKAGE_VERSION } from "./version.js";
 // Configuration: Default values (used as fallback if env vars are unavailable)
 const DEFAULT_BLACKLIST_URLS = []; // regexp for blacklisted urls
 const DEFAULT_WHITELIST_ORIGINS = [".*"]; // regexp for whitelisted origins
+const DEFAULT_BACKUP_CORS_SERVERS = []; // backup CORS proxy servers
+const DEFAULT_MAX_RETRY_ATTEMPTS = 3; // number of retries after the initial direct attempt
 const DEFAULT_VERSION = PACKAGE_VERSION; // Version from package.json (auto-generated)
+const RETRYABLE_5XX_STATUS_CODES = new Set([502, 503]);
+const PREFERRED_BACKUP_TTL_SECONDS = 15 * 60; // 15 minutes
+const PREFERRED_BACKUP_KV_KEY_PREFIX = "backup-preference:";
 
 /**
  * Get version metadata from Cloudflare Version Metadata binding or environment variable or default
@@ -81,12 +86,54 @@ function getVersionMetadata(env) {
     };
 }
 
+function parseBackupCorsServers(rawBackupServers) {
+    if (Array.isArray(rawBackupServers)) {
+        return rawBackupServers;
+    }
+
+    if (typeof rawBackupServers !== "string") {
+        return [];
+    }
+
+    const trimmed = rawBackupServers.trim();
+    if (!trimmed) {
+        return [];
+    }
+
+    // Preferred format: JSON array
+    if (trimmed.startsWith("[")) {
+        const parsed = JSON.parse(trimmed);
+        if (!Array.isArray(parsed)) {
+            throw new Error("BACKUP_CORS_SERVERS JSON must be an array");
+        }
+        return parsed;
+    }
+
+    // Compatibility: quoted list without []
+    // Example: "https://a?url={url}","https://b?url={url}"
+    if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.includes('","')) {
+        const parsed = JSON.parse(`[${trimmed}]`);
+        if (!Array.isArray(parsed)) {
+            throw new Error("BACKUP_CORS_SERVERS quoted list must be an array");
+        }
+        return parsed;
+    }
+
+    // Compatibility: comma/newline separated plain URLs
+    return trimmed
+        .split(/\r?\n|,/)
+        .map(entry => entry.trim().replace(/^['"]|['"]$/g, ""))
+        .filter(Boolean);
+}
+
 /**
  * Get configuration from Cloudflare Secrets or environment variables, with fallback to defaults
  *
  * Configuration values should be JSON arrays:
  * - BLACKLIST_URLS: JSON array of regex patterns for blacklisted URLs
  * - WHITELIST_ORIGINS: JSON array of regex patterns for whitelisted origins
+ * - BACKUP_CORS_SERVERS: JSON array of backup CORS proxy URLs
+ * - MAX_RETRY_ATTEMPTS: non-negative integer retry count after first attempt
  *
  * Priority order (highest to lowest):
  * 1. Direct secrets (env.BLACKLIST_URLS) - set via wrangler secret put
@@ -96,17 +143,23 @@ function getVersionMetadata(env) {
  * Setup using Cloudflare Secrets (recommended for security):
  *   wrangler secret put BLACKLIST_URLS
  *   wrangler secret put WHITELIST_ORIGINS
+ *   wrangler secret put BACKUP_CORS_SERVERS
+ *   wrangler secret put MAX_RETRY_ATTEMPTS
  *
  * Or using wrangler.toml [vars] section (for non-sensitive config):
  *   [vars]
  *   BLACKLIST_URLS = '["^https?://malicious\\.com"]'
  *   WHITELIST_ORIGINS = '["^https://example\\.com$"]'
+ *   BACKUP_CORS_SERVERS = '["https://backup-1.workers.dev", "https://backup-2.workers.dev"]'
+ *   MAX_RETRY_ATTEMPTS = '3'
  *
  * Secrets take precedence over vars if both are set.
  */
 function getConfig(env) {
     let blacklistUrls = DEFAULT_BLACKLIST_URLS;
     let whitelistOrigins = DEFAULT_WHITELIST_ORIGINS;
+    let backupCorsServers = DEFAULT_BACKUP_CORS_SERVERS;
+    let maxRetryAttempts = DEFAULT_MAX_RETRY_ATTEMPTS;
 
     // Try to read from environment variables
     if (env) {
@@ -149,9 +202,159 @@ function getConfig(env) {
                 whitelistOrigins = DEFAULT_WHITELIST_ORIGINS;
             }
         }
+
+        // Parse backup CORS servers from env var (JSON array)
+        // Supports both BACKUP_CORS_SERVERS (preferred) and legacy DEFAULT_BACKUP_CORS_SERVERS.
+        const rawBackupServers = env.BACKUP_CORS_SERVERS ?? env.DEFAULT_BACKUP_CORS_SERVERS;
+        if (rawBackupServers !== undefined && rawBackupServers !== null && rawBackupServers !== "") {
+            try {
+                if (!env.BACKUP_CORS_SERVERS && env.DEFAULT_BACKUP_CORS_SERVERS) {
+                    console.warn(
+                        `[${new Date().toISOString()}] ⚠️  Using legacy env key DEFAULT_BACKUP_CORS_SERVERS; prefer BACKUP_CORS_SERVERS`
+                    );
+                }
+
+                const parsedBackupServers = parseBackupCorsServers(rawBackupServers);
+
+                if (!Array.isArray(parsedBackupServers)) {
+                    console.warn(
+                        `[${new Date().toISOString()}] ⚠️  BACKUP_CORS_SERVERS must be a JSON array, using default`
+                    );
+                    backupCorsServers = DEFAULT_BACKUP_CORS_SERVERS;
+                } else {
+                    backupCorsServers = Array.from(
+                        new Set(
+                            parsedBackupServers
+                                .filter(server => typeof server === "string" && server.trim() !== "")
+                                .map(server => {
+                                    const trimmedServer = server.trim();
+                                    const normalized = trimmedServer.match(/^https?:\/\//i)
+                                        ? trimmedServer
+                                        : `https://${trimmedServer}`;
+
+                                    // Keep template placeholders (e.g. {url}) as-is.
+                                    // Validate by substituting a sample URL only for parsing.
+                                    const validationUrl = normalized.replaceAll("{url}", "https://example.com");
+                                    new URL(validationUrl);
+
+                                    return normalized.replace(/\/+$/, "");
+                                })
+                        )
+                    );
+
+                    console.log(
+                        `[${new Date().toISOString()}] 📝  BACKUP_CORS_SERVERS: ${JSON.stringify(
+                            backupCorsServers
+                        )}`
+                    );
+                }
+            } catch (e) {
+                console.warn(
+                    `[${new Date().toISOString()}] ⚠️  Failed to parse BACKUP_CORS_SERVERS from env: ${e.message}. Supported formats: JSON array, quoted list, comma/newline separated URLs. Using default`
+                );
+                backupCorsServers = DEFAULT_BACKUP_CORS_SERVERS;
+            }
+        }
+
+        // Parse max retry attempts from env var (non-negative integer)
+        if (env.MAX_RETRY_ATTEMPTS !== undefined) {
+            const parsedMaxRetryAttempts = Number.parseInt(env.MAX_RETRY_ATTEMPTS, 10);
+            if (Number.isInteger(parsedMaxRetryAttempts) && parsedMaxRetryAttempts >= 0) {
+                maxRetryAttempts = parsedMaxRetryAttempts;
+            } else {
+                console.warn(
+                    `[${new Date().toISOString()}] ⚠️  MAX_RETRY_ATTEMPTS must be a non-negative integer, using default`
+                );
+                maxRetryAttempts = DEFAULT_MAX_RETRY_ATTEMPTS;
+            }
+        }
     }
 
-    return { blacklistUrls, whitelistOrigins };
+    return { blacklistUrls, whitelistOrigins, backupCorsServers, maxRetryAttempts };
+}
+
+function isRetryableStatusCode(statusCode) {
+    return (statusCode >= 400 && statusCode < 500) || RETRYABLE_5XX_STATUS_CODES.has(statusCode);
+}
+
+function buildBackupTargetUrl(backupCorsServer, destinationUrl) {
+    // Backup format: server URL contains a {url} placeholder.
+    // Example: https://backup.server.com/?url={url}
+    return backupCorsServer
+        .replaceAll("{url}", destinationUrl)
+        .replace(/%7Burl%7D/gi, destinationUrl);
+}
+
+function buildPreferredBackupCacheKey(targetUrl) {
+    return `${PREFERRED_BACKUP_KV_KEY_PREFIX}${encodeURIComponent(targetUrl)}`;
+}
+
+function hasSensitiveHeadersForBackup(request, customHeaders) {
+    const sensitiveHeaderNames = new Set([
+        "authorization",
+        "proxy-authorization",
+        "x-api-key",
+        "api-key",
+        "x-auth-token",
+        "x-access-token"
+    ]);
+
+    for (const [key] of request.headers.entries()) {
+        if (sensitiveHeaderNames.has(key.toLowerCase())) {
+            return true;
+        }
+    }
+
+    if (customHeaders && typeof customHeaders === "object") {
+        for (const key of Object.keys(customHeaders)) {
+            if (sensitiveHeaderNames.has(String(key).toLowerCase())) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+async function getPreferredBackupServer(env, targetUrl) {
+    try {
+        const backupServerCache = env?.BACKUP_SERVER_CACHE;
+        if (!backupServerCache || typeof backupServerCache.get !== "function") {
+            return null;
+        }
+
+        const cacheKey = buildPreferredBackupCacheKey(targetUrl);
+        const cachedValue = await backupServerCache.get(cacheKey);
+        const preferredBackupServer = typeof cachedValue === "string" ? cachedValue.trim() : "";
+        return preferredBackupServer || null;
+    } catch (error) {
+        console.warn(
+            `[${new Date().toISOString()}] ⚠️  Failed to read preferred backup cache for ${targetUrl}: ${
+                error.message
+            }`
+        );
+        return null;
+    }
+}
+
+async function setPreferredBackupServer(env, targetUrl, backupCorsServer) {
+    try {
+        const backupServerCache = env?.BACKUP_SERVER_CACHE;
+        if (!backupServerCache || typeof backupServerCache.put !== "function") {
+            return;
+        }
+
+        const cacheKey = buildPreferredBackupCacheKey(targetUrl);
+        await backupServerCache.put(cacheKey, backupCorsServer, {
+            expirationTtl: PREFERRED_BACKUP_TTL_SECONDS
+        });
+    } catch (error) {
+        console.warn(
+            `[${new Date().toISOString()}] ⚠️  Failed to write preferred backup cache for ${targetUrl}: ${
+                error.message
+            }`
+        );
+    }
 }
 
 // Bot Detection Note:
@@ -250,6 +453,7 @@ export default {
         const isPreflightRequest = request.method === "OPTIONS";
 
         const originUrl = new URL(request.url);
+        const allowSensitiveBackup = originUrl.searchParams.get("allowSensitive") === "true";
 
         // Load configuration from environment variables (with fallback to defaults)
         const config = getConfig(env);
@@ -584,25 +788,202 @@ export default {
                 Object.assign(filteredHeaders, customHeaders);
             }
 
-            // Create new request with explicit method, body, and URL to ensure all HTTP methods work
-            // This preserves the original request method (GET, POST, PUT, DELETE, PATCH, etc.)
-            // and forwards the body for methods that need it
             const requestMethod = request.method;
 
-            // Create a new request copying all properties from the original request
-            // but with the target URL and filtered headers
-            const newRequest = new Request(targetUrl, {
-                method: requestMethod,
-                headers: filteredHeaders,
-                body: request.body, // Request constructor handles body appropriately
-                redirect: "follow"
+            // Read body once so it can be replayed across retries and backup servers
+            const hasRequestBody = !["GET", "HEAD"].includes(requestMethod.toUpperCase());
+            const requestBody = hasRequestBody ? await request.clone().arrayBuffer() : null;
+
+            // Build attempt sequence: direct target first, then backup CORS servers
+            const filteredBackupServers = config.backupCorsServers.filter(server => {
+                try {
+                    return new URL(server).origin !== originUrl.origin;
+                } catch (e) {
+                    return false;
+                }
             });
 
-            try {
+            const prioritizedBackupServers = [...filteredBackupServers];
+            let preferredBackupCacheHit = false;
+            if (prioritizedBackupServers.length > 0) {
+                const preferredBackupServer = await getPreferredBackupServer(env, targetUrl);
+                if (preferredBackupServer && prioritizedBackupServers.includes(preferredBackupServer)) {
+                    const preferredIndex = prioritizedBackupServers.indexOf(preferredBackupServer);
+                    prioritizedBackupServers.splice(preferredIndex, 1);
+                    prioritizedBackupServers.unshift(preferredBackupServer);
+                    preferredBackupCacheHit = true;
+
+                    console.log(
+                        `[${new Date().toISOString()}] ⭐ Preferred backup server hit: ${preferredBackupServer} | TTL: ${PREFERRED_BACKUP_TTL_SECONDS}s`
+                    );
+                }
+            }
+
+            const preferredBackupServer = prioritizedBackupServers[0] || null;
+            const hasPreferredBackup = preferredBackupCacheHit && Boolean(preferredBackupServer);
+
+            const attemptTargets = [
+                ...(hasPreferredBackup
+                    ? [
+                          {
+                              url: buildBackupTargetUrl(preferredBackupServer, targetUrl),
+                              mode: "backup",
+                              backupServer: preferredBackupServer,
+                              preferred: true
+                          }
+                      ]
+                    : []),
+                { url: targetUrl, mode: "direct" },
+                ...prioritizedBackupServers
+                    .slice(hasPreferredBackup ? 1 : 0)
+                    .map(server => ({
+                        url: buildBackupTargetUrl(server, targetUrl),
+                        mode: "backup",
+                        backupServer: server,
+                        preferred: false
+                    }))
+            ];
+
+            if (prioritizedBackupServers.length > 0) {
                 console.log(
-                    `[${new Date().toISOString()}] Fetching target URL: ${targetUrl} | Method: ${requestMethod}`
+                    `[${new Date().toISOString()}] 🧭 Backup server order for ${targetUrl}: ${prioritizedBackupServers.join(
+                        " -> "
+                    )}`
                 );
-                const response = await fetch(targetUrl, newRequest);
+            }
+
+            // MAX_RETRY_ATTEMPTS means retry count after initial attempt
+            const maxTotalAttempts = Math.max(1, config.maxRetryAttempts + 1);
+
+            const createAttemptRequest = attemptUrl =>
+                new Request(attemptUrl, {
+                    method: requestMethod,
+                    headers: filteredHeaders,
+                    body: hasRequestBody ? requestBody : null,
+                    redirect: "follow"
+                });
+
+            try {
+                let lastNetworkError = null;
+
+                for (let attemptIndex = 0; attemptIndex < maxTotalAttempts; attemptIndex++) {
+                    const targetIndex = Math.min(attemptIndex, attemptTargets.length - 1);
+                    const currentAttemptTarget = attemptTargets[targetIndex];
+                    const isLastAttempt = attemptIndex === maxTotalAttempts - 1;
+                    const currentAttemptNumber = attemptIndex + 1;
+
+                    if (
+                        currentAttemptTarget.mode === "backup" &&
+                        !allowSensitiveBackup &&
+                        hasSensitiveHeadersForBackup(request, customHeaders)
+                    ) {
+                        console.warn(
+                            `[${new Date().toISOString()}] 🚫 Backup usage blocked due to sensitive request headers | Target: ${targetUrl}`
+                        );
+
+                        const blockedHeaders = new Headers();
+                        setupCORSHeaders(blockedHeaders);
+                        blockedHeaders.set("Content-Type", "text/plain; charset=utf-8");
+
+                        return new Response(
+                            "Forbidden: backup proxy is blocked when request contains sensitive headers",
+                            {
+                                status: 403,
+                                statusText: "Forbidden",
+                                headers: blockedHeaders
+                            }
+                        );
+                    }
+
+                    if (
+                        currentAttemptTarget.mode === "backup" &&
+                        allowSensitiveBackup &&
+                        hasSensitiveHeadersForBackup(request, customHeaders)
+                    ) {
+                        console.warn(
+                            `[${new Date().toISOString()}] ⚠️  Sensitive headers allowed for backup because allowSensitive=true | Target: ${targetUrl}`
+                        );
+                    }
+
+                    if (currentAttemptTarget.mode === "backup") {
+                        console.log(
+                            `[${new Date().toISOString()}] 🔁 Trying backup server (${currentAttemptNumber}/${maxTotalAttempts}): ${
+                                currentAttemptTarget.backupServer
+                            } | Target: ${targetUrl}`
+                        );
+                    }
+
+                    console.log(
+                        `[${new Date().toISOString()}] Fetching attempt ${currentAttemptNumber}/${maxTotalAttempts}: ${
+                            currentAttemptTarget.url
+                        } | Mode: ${currentAttemptTarget.mode} | Method: ${requestMethod}`
+                    );
+
+                    let response;
+                    try {
+                        response = await fetch(createAttemptRequest(currentAttemptTarget.url));
+                    } catch (error) {
+                        lastNetworkError = error;
+
+                        if (currentAttemptTarget.mode === "backup") {
+                            console.warn(
+                                `[${new Date().toISOString()}] ⚠️  Backup server network failure: ${
+                                    currentAttemptTarget.backupServer
+                                } | Error: ${error.message}`
+                            );
+                        }
+
+                        if (!isLastAttempt) {
+                            console.warn(
+                                `[${new Date().toISOString()}] ⚠️  Network error on attempt ${currentAttemptNumber}/${maxTotalAttempts}: ${
+                                    error.message
+                                } | Retrying...`
+                            );
+                            continue;
+                        }
+
+                        throw error;
+                    }
+
+                    // Retry on selected upstream status codes
+                    if (isRetryableStatusCode(response.status) && !isLastAttempt) {
+                        if (currentAttemptTarget.mode === "backup") {
+                            console.warn(
+                                `[${new Date().toISOString()}] ⚠️  Backup server retryable status: ${
+                                    currentAttemptTarget.backupServer
+                                } | Status: ${response.status} | Trying next server...`
+                            );
+                        }
+
+                        console.warn(
+                            `[${new Date().toISOString()}] ⚠️  Retryable status ${response.status} on attempt ${currentAttemptNumber}/${maxTotalAttempts} | Retrying...`
+                        );
+
+                        // Ensure body stream is closed before retrying
+                        if (response.body) {
+                            response.body.cancel();
+                        }
+                        continue;
+                    }
+
+                    if (currentAttemptTarget.mode === "backup") {
+                        console.log(
+                            `[${new Date().toISOString()}] 🔁 Using ${
+                                currentAttemptTarget.preferred ? "preferred " : ""
+                            }backup CORS server: ${currentAttemptTarget.backupServer} | Attempt: ${currentAttemptNumber}/${maxTotalAttempts}`
+                        );
+
+                        if (!isRetryableStatusCode(response.status)) {
+                            ctx.waitUntil(
+                                setPreferredBackupServer(
+                                    env,
+                                    targetUrl,
+                                    currentAttemptTarget.backupServer
+                                )
+                            );
+                        }
+                    }
+
                 const responseHeaders = new Headers(response.headers);
                 const exposedHeaders = Array.from(response.headers.keys());
                 const allResponseHeaders = Object.fromEntries(response.headers.entries());
@@ -683,6 +1064,10 @@ export default {
                     status: isPreflightRequest ? 200 : response.status,
                     statusText: isPreflightRequest ? "OK" : response.statusText
                 });
+                }
+
+                // Should never happen, but keep a deterministic fallback
+                throw lastNetworkError || new Error("All upstream attempts failed");
             } catch (error) {
                 const duration = Date.now() - startTime;
                 console.error(
@@ -744,6 +1129,13 @@ export default {
                 "Usage:",
                 `${originUrl.origin}/?url={targetUrl}`,
                 `or: ${originUrl.origin}/?{targetUrl}`,
+                `allow sensitive headers for backup: ${originUrl.origin}/?url={targetUrl}&allowSensitive=true`,
+                "",
+                "Backup:",
+                "BACKUP_CORS_SERVERS must contain {url} placeholder",
+                "Retryable statuses: all 4xx + 502 + 503",
+                "Preferred backup server is cached for 15 minutes (KV)",
+                "Sensitive headers block backup by default (override with allowSensitive=true)",
                 "",
                 "Limits: 100,000 requests/day",
                 "          1,000 requests/10 minutes",
