@@ -1,4 +1,4 @@
-# cloudflare-cors-anywhere
+# cloudflare-cors-anywhere-re
 
 Cloudflare CORS proxy in a worker. This worker enables cross-origin requests by acting as a proxy, automatically adding the necessary CORS headers to responses.
 
