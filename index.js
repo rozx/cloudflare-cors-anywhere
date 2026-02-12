@@ -25,7 +25,7 @@ const DEFAULT_WHITELIST_ORIGINS = [".*"]; // regexp for whitelisted origins
 const DEFAULT_BACKUP_CORS_SERVERS = []; // backup CORS proxy servers
 const DEFAULT_MAX_RETRY_ATTEMPTS = 3; // number of retries after the initial direct attempt
 const DEFAULT_VERSION = PACKAGE_VERSION; // Version from package.json (auto-generated)
-const RETRYABLE_5XX_STATUS_CODES = new Set([502, 503]);
+const RETRYABLE_STATUS_CODES = new Set([403, 429, 502, 503]);
 const PREFERRED_BACKUP_TTL_SECONDS = 15 * 60; // 15 minutes
 const PREFERRED_BACKUP_KV_KEY_PREFIX = "backup-preference:";
 let backupServerRotationCursor = 0;
@@ -190,7 +190,16 @@ function normalizeBackupCorsServerEntries(parsedBackupServers) {
             ? trimmedTemplate
             : `https://${trimmedTemplate}`;
         const validationUrl = normalizedTemplate.replaceAll("{url}", "https://example.com");
-        new URL(validationUrl);
+        try {
+            new URL(validationUrl);
+        } catch (e) {
+            console.warn(
+                `[${new Date().toISOString()}] ⚠️  Skipping invalid backup server URL at index ${index}: ${trimmedTemplate} (${
+                    e.message
+                })`
+            );
+            return;
+        }
 
         const templateWithoutTrailingSlash = normalizedTemplate.replace(/\/+$/, "");
         if (seenTemplates.has(templateWithoutTrailingSlash)) {
@@ -340,15 +349,18 @@ function getConfig(env) {
 }
 
 function isRetryableStatusCode(statusCode) {
-    return (statusCode >= 400 && statusCode < 500) || RETRYABLE_5XX_STATUS_CODES.has(statusCode);
+    return RETRYABLE_STATUS_CODES.has(statusCode);
 }
 
 function buildBackupTargetUrl(backupCorsServer, destinationUrl) {
     // Backup format: server URL contains a {url} placeholder.
     // Example: https://backup.server.com/?url={url}
+    // URL-encode the destination to prevent query parameter corruption
+    // e.g. target "https://api.com/data?key=1&fmt=json" won't break the backup URL structure
+    const encodedDestinationUrl = encodeURIComponent(destinationUrl);
     return backupCorsServer
-        .replaceAll("{url}", destinationUrl)
-        .replace(/%7Burl%7D/gi, destinationUrl);
+        .replaceAll("{url}", encodedDestinationUrl)
+        .replace(/%7Burl%7D/gi, encodedDestinationUrl);
 }
 
 function getPreferredBackupScope(targetUrl) {
@@ -388,7 +400,7 @@ function getNextBackupRotationStart(totalServers) {
     return startIndex;
 }
 
-function hasSensitiveHeadersForBackup(request, customHeaders) {
+function getSensitiveHeadersForBackup(request, customHeaders) {
     const sensitiveHeaderNames = new Set([
         "authorization",
         "proxy-authorization",
@@ -398,21 +410,23 @@ function hasSensitiveHeadersForBackup(request, customHeaders) {
         "x-access-token"
     ]);
 
+    const detectedHeaders = [];
+
     for (const [key] of request.headers.entries()) {
         if (sensitiveHeaderNames.has(key.toLowerCase())) {
-            return true;
+            detectedHeaders.push(key);
         }
     }
 
     if (customHeaders && typeof customHeaders === "object") {
         for (const key of Object.keys(customHeaders)) {
             if (sensitiveHeaderNames.has(String(key).toLowerCase())) {
-                return true;
+                detectedHeaders.push(key);
             }
         }
     }
 
-    return false;
+    return detectedHeaders;
 }
 
 async function getPreferredBackupServer(env, targetUrl) {
@@ -466,6 +480,13 @@ async function clearPreferredBackupServer(env, targetUrl, reason = "") {
         const targetDomain = getPreferredBackupScope(targetUrl);
         const cacheKey = buildPreferredBackupCacheKey(targetUrl);
         await backupServerCache.delete(cacheKey);
+
+        if (reason) {
+            console.log(
+                `[${new Date().toISOString()}] ℹ️  Cleared preferred backup cache for ${targetDomain ||
+                    targetUrl}: ${reason}`
+            );
+        }
     } catch (error) {
         const targetDomain = getPreferredBackupScope(targetUrl);
         console.warn(
@@ -484,7 +505,7 @@ async function clearPreferredBackupServer(env, targetUrl, reason = "") {
 // 3. Deploying on platforms that support headless browsers (Vercel, AWS Lambda, etc.)
 
 // Function to check if a given URI or origin is listed in the whitelist or blacklist
-function isListedInWhitelist(uri, listing) {
+function matchesPatternList(uri, listing) {
     if (typeof uri === "string") {
         return listing.some(pattern => uri.match(pattern) !== null);
     }
@@ -553,11 +574,6 @@ function shouldStreamResponse(response, request, targetUrl) {
     // Anthropic streaming: text/event-stream or application/x-ndjson
     // Other APIs may use application/json with chunked encoding
     if (contentType.includes("application/x-ndjson")) {
-        return true;
-    }
-
-    // If content-type is text/plain and we have chunked encoding, likely streaming
-    if (contentType.includes("text/plain") && transferEncoding.toLowerCase().includes("chunked")) {
         return true;
     }
 
@@ -720,7 +736,11 @@ export default {
         if (customHeaders !== null) {
             try {
                 customHeaders = JSON.parse(customHeaders);
-            } catch (e) {}
+            } catch (e) {
+                console.warn(
+                    `[${new Date().toISOString()}] ⚠️  Failed to parse x-cors-headers: ${e.message}`
+                );
+            }
         }
 
         // Handle OPTIONS preflight requests early - don't forward to target URL
@@ -728,8 +748,8 @@ export default {
             // Validate origin and target URL exist
             if (
                 targetUrl &&
-                !isListedInWhitelist(targetUrl, config.blacklistUrls) &&
-                isListedInWhitelist(originHeader, config.whitelistOrigins)
+                !matchesPatternList(targetUrl, config.blacklistUrls) &&
+                matchesPatternList(originHeader, config.whitelistOrigins)
             ) {
                 const preflightHeaders = new Headers();
                 setupCORSHeaders(preflightHeaders);
@@ -763,8 +783,8 @@ export default {
 
         if (
             targetUrl &&
-            !isListedInWhitelist(targetUrl, config.blacklistUrls) &&
-            isListedInWhitelist(originHeader, config.whitelistOrigins)
+            !matchesPatternList(targetUrl, config.blacklistUrls) &&
+            matchesPatternList(originHeader, config.whitelistOrigins)
         ) {
             // Fetch the target URL
             const filteredHeaders = {};
@@ -890,7 +910,7 @@ export default {
 
             // Read body once so it can be replayed across retries and backup servers
             const hasRequestBody = !["GET", "HEAD"].includes(requestMethod.toUpperCase());
-            const requestBody = hasRequestBody ? await request.clone().arrayBuffer() : null;
+            const requestBody = hasRequestBody ? await request.arrayBuffer() : null;
 
             // Build attempt sequence: direct target first, then backup CORS servers
             const filteredBackupServers = config.backupCorsServers.filter(server => {
@@ -907,25 +927,29 @@ export default {
             let prioritizedBackupServers = [...filteredBackupServers];
             let preferredBackupCacheHit = false;
             let preferredBackupServer = null;
-            preferredBackupServer = await getPreferredBackupServer(env, targetUrl);
-            if (preferredBackupServer) {
-                const preferredIndex = prioritizedBackupServers.findIndex(
-                    server => server.template === preferredBackupServer
-                );
-                if (preferredIndex >= 0) {
-                    const preferredServerConfig = prioritizedBackupServers[preferredIndex];
-                    prioritizedBackupServers.splice(preferredIndex, 1);
-                    prioritizedBackupServers.unshift(preferredServerConfig);
-                    preferredBackupCacheHit = true;
-                } else {
-                    ctx.waitUntil(
-                        clearPreferredBackupServer(
-                            env,
-                            targetUrl,
-                            "cached server is no longer in BACKUP_CORS_SERVERS"
-                        )
+
+            // Only read KV when backup servers are configured to avoid wasted I/O
+            if (filteredBackupServers.length > 0) {
+                preferredBackupServer = await getPreferredBackupServer(env, targetUrl);
+                if (preferredBackupServer) {
+                    const preferredIndex = prioritizedBackupServers.findIndex(
+                        server => server.template === preferredBackupServer
                     );
-                    preferredBackupServer = null;
+                    if (preferredIndex >= 0) {
+                        const preferredServerConfig = prioritizedBackupServers[preferredIndex];
+                        prioritizedBackupServers.splice(preferredIndex, 1);
+                        prioritizedBackupServers.unshift(preferredServerConfig);
+                        preferredBackupCacheHit = true;
+                    } else {
+                        ctx.waitUntil(
+                            clearPreferredBackupServer(
+                                env,
+                                targetUrl,
+                                "cached server is no longer in BACKUP_CORS_SERVERS"
+                            )
+                        );
+                        preferredBackupServer = null;
+                    }
                 }
             }
 
@@ -954,7 +978,7 @@ export default {
                 }
             }
 
-            const attemptTargets = [
+            let attemptTargets = [
                 { url: targetUrl, mode: "direct" },
                 ...prioritizedBackupServers.map(server => ({
                     url: buildBackupTargetUrl(server.template, targetUrl),
@@ -967,12 +991,6 @@ export default {
                         server.template === preferredBackupServer
                 }))
             ];
-
-            // MAX_RETRY_ATTEMPTS means retry count after initial attempt.
-            // Ensure we still try every backup server at least once before giving up,
-            // otherwise a small retry value could fail early without reaching next backup.
-            const configuredMaxAttempts = Math.max(1, config.maxRetryAttempts + 1);
-            const maxTotalAttempts = Math.max(configuredMaxAttempts, attemptTargets.length);
 
             const createAttemptRequest = attemptTarget => {
                 const attemptHeaders = { ...filteredHeaders };
@@ -990,46 +1008,57 @@ export default {
 
             try {
                 let lastNetworkError = null;
-                let loggedSensitiveBackupOverride = false;
 
-                for (let attemptIndex = 0; attemptIndex < maxTotalAttempts; attemptIndex++) {
+                const sensitiveHeaders = getSensitiveHeadersForBackup(request, customHeaders);
+                const hasSensitiveHeaders = sensitiveHeaders.length > 0;
+                const hasBackupTargets = attemptTargets.some(t => t.mode === "backup");
+
+                // Check sensitive header restrictions once before entering the retry loop
+                if (hasBackupTargets && hasSensitiveHeaders && !allowSensitiveBackup) {
+                    // Strip all backup targets — only direct attempt is allowed
+                    const directOnly = attemptTargets.filter(t => t.mode === "direct");
+                    attemptTargets.length = 0;
+                    attemptTargets.push(...directOnly);
+
+                    console.warn(
+                        `[${new Date().toISOString()}] 🚫 Backup servers removed from attempt list due to sensitive request headers: ${sensitiveHeaders.join(
+                            ", "
+                        )} | Target: ${targetUrl}`
+                    );
+                } else if (hasBackupTargets && hasSensitiveHeaders && allowSensitiveBackup) {
+                    console.warn(
+                        `[${new Date().toISOString()}] ⚠️  Sensitive headers allowed for backup because allowSensitive=true. Headers: ${sensitiveHeaders.join(
+                            ", "
+                        )} | Target: ${targetUrl}`
+                    );
+                }
+
+                // Recalculate max attempts after potential target list trimming
+                const effectiveMaxAttempts = Math.max(
+                    Math.max(1, config.maxRetryAttempts + 1),
+                    attemptTargets.length
+                );
+
+                for (let attemptIndex = 0; attemptIndex < effectiveMaxAttempts; attemptIndex++) {
                     const targetIndex = Math.min(attemptIndex, attemptTargets.length - 1);
                     const currentAttemptTarget = attemptTargets[targetIndex];
-                    const isLastAttempt = attemptIndex === maxTotalAttempts - 1;
+                    const isLastAttempt = attemptIndex === effectiveMaxAttempts - 1;
 
-                    if (
-                        currentAttemptTarget.mode === "backup" &&
-                        !allowSensitiveBackup &&
-                        hasSensitiveHeadersForBackup(request, customHeaders)
-                    ) {
-                        console.warn(
-                            `[${new Date().toISOString()}] 🚫 Backup usage blocked due to sensitive request headers | Target: ${targetUrl}`
-                        );
-
-                        const blockedHeaders = new Headers();
-                        setupCORSHeaders(blockedHeaders);
-                        blockedHeaders.set("Content-Type", "text/plain; charset=utf-8");
-
-                        return new Response(
-                            "Forbidden: backup proxy is blocked when request contains sensitive headers",
-                            {
-                                status: 403,
-                                statusText: "Forbidden",
-                                headers: blockedHeaders
-                            }
+                    if (currentAttemptTarget.mode === "backup") {
+                        console.log(
+                            `[${new Date().toISOString()}] ℹ️  Using backup server: ${
+                                currentAttemptTarget.backupServer
+                            } | Target: ${targetUrl}`
                         );
                     }
 
-                    if (
-                        currentAttemptTarget.mode === "backup" &&
-                        allowSensitiveBackup &&
-                        hasSensitiveHeadersForBackup(request, customHeaders) &&
-                        !loggedSensitiveBackupOverride
-                    ) {
-                        loggedSensitiveBackupOverride = true;
-                        console.warn(
-                            `[${new Date().toISOString()}] ⚠️  Sensitive headers allowed for backup because allowSensitive=true | Target: ${targetUrl}`
+                    // Apply backoff delay when retrying the same server (exhausted all unique targets)
+                    if (attemptIndex >= attemptTargets.length) {
+                        const backoffMs = Math.min(
+                            500 * (attemptIndex - attemptTargets.length + 1),
+                            2000
                         );
+                        await new Promise(resolve => setTimeout(resolve, backoffMs));
                     }
 
                     let response;
@@ -1037,6 +1066,14 @@ export default {
                         response = await fetch(createAttemptRequest(currentAttemptTarget));
                     } catch (error) {
                         lastNetworkError = error;
+
+                        console.warn(
+                            `[${new Date().toISOString()}] ⚠️  Failed to reach ${
+                                currentAttemptTarget.mode === "direct" ? "target" : "backup"
+                            } URL: ${currentAttemptTarget.url} | Error: ${
+                                error.message
+                            } | Attempt: ${attemptIndex + 1}/${effectiveMaxAttempts}`
+                        );
 
                         if (
                             currentAttemptTarget.mode === "backup" &&
@@ -1111,9 +1148,7 @@ export default {
                     // For streaming responses, pass through the stream directly
                     // For non-streaming, buffer the response as before for backward compatibility
                     let responseBody;
-                    if (isPreflightRequest) {
-                        responseBody = null;
-                    } else if (isStreaming) {
+                    if (isStreaming) {
                         // Pass through the stream directly - don't buffer
                         // This allows Server-Sent Events and chunked streaming to work properly
                         responseBody = response.body;
@@ -1137,8 +1172,8 @@ export default {
 
                     return new Response(responseBody, {
                         headers: responseHeaders,
-                        status: isPreflightRequest ? 200 : response.status,
-                        statusText: isPreflightRequest ? "OK" : response.statusText
+                        status: response.status,
+                        statusText: response.statusText
                     });
                 }
 
@@ -1210,7 +1245,7 @@ export default {
                 "Backup:",
                 "BACKUP_CORS_SERVERS must contain {url} placeholder",
                 'Supports per-backup headers: {"url":"...","headers":{"x-cors-api-key":"..."}}',
-                "Retryable statuses: all 4xx + 502 + 503",
+                "Retryable statuses: 403 + 502 + 503",
                 "Backup servers rotate each request (preferred stays first, others rotate)",
                 "Successful backup is cached as preferred for 15 minutes per domain (KV)",
                 "Sensitive headers block backup by default (override with allowSensitive=true)",
@@ -1243,8 +1278,8 @@ export default {
             errorHeaders.set("Content-Type", "text/html");
 
             return new Response(
-                "Create your own CORS proxy</br>\n" +
-                    "<a href='https://github.com/rozx/cloudflare-cors-anywhere'>https://github.com/rozx/cloudflare-cors-anywhere</a></br>\n",
+                "Create your own CORS proxy<br>\n" +
+                    "<a href='https://github.com/rozx/cloudflare-cors-anywhere'>https://github.com/rozx/cloudflare-cors-anywhere</a><br>\n",
                 {
                     status: 403,
                     statusText: "Forbidden",

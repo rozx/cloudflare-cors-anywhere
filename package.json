@@ -1,13 +1,13 @@
 {
     "name": "cloudflare-cors-anywhere",
-    "version": "1.3.3",
+    "version": "1.3.4",
     "description": "A CORS proxy running as a Cloudflare Worker",
     "main": "index.js",
     "scripts": {
         "test": "echo \"Error: no test specified\" && exit 1",
         "update-version": "node scripts/update-version.js",
         "predeploy": "npm run update-version",
-        "deploy": "wrangler deploy --var VERSION:$(node -p \"require('./package.json').version\")",
+        "deploy": "node scripts/deploy.js",
         "logs": "wrangler tail",
         "logs:json": "wrangler tail --format json"
     },
