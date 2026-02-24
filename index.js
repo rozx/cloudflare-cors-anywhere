@@ -429,16 +429,50 @@ function getSensitiveHeadersForBackup(request, customHeaders) {
     return detectedHeaders;
 }
 
+const localBackupCache = new Map();
+const MAX_LOCAL_CACHE_SIZE = 1000;
+
+function setLocalCache(key, value, ttlMillis) {
+    if (localBackupCache.size >= MAX_LOCAL_CACHE_SIZE) {
+        const firstKey = localBackupCache.keys().next().value;
+        localBackupCache.delete(firstKey);
+    }
+    localBackupCache.set(key, { value, exp: Date.now() + ttlMillis });
+}
+
+function getLocalCache(key) {
+    const item = localBackupCache.get(key);
+    if (!item) return undefined;
+    if (Date.now() > item.exp) {
+        localBackupCache.delete(key);
+        return undefined;
+    }
+    return item.value;
+}
+
 async function getPreferredBackupServer(env, targetUrl) {
     try {
+        const cacheKey = buildPreferredBackupCacheKey(targetUrl);
+        const localValue = getLocalCache(cacheKey);
+        if (localValue !== undefined) {
+            return localValue === "" ? null : localValue;
+        }
+
         const backupServerCache = env?.BACKUP_SERVER_CACHE;
         if (!backupServerCache || typeof backupServerCache.get !== "function") {
             return null;
         }
 
-        const cacheKey = buildPreferredBackupCacheKey(targetUrl);
         const cachedValue = await backupServerCache.get(cacheKey);
         const preferredBackupServer = typeof cachedValue === "string" ? cachedValue.trim() : "";
+        
+        if (preferredBackupServer) {
+            setLocalCache(cacheKey, preferredBackupServer, PREFERRED_BACKUP_TTL_SECONDS * 1000);
+        } else {
+            // Negative cache for 1 minute to avoid spamming KV for targets without backup servers
+            setLocalCache(cacheKey, "", 60 * 1000);
+        }
+
         return preferredBackupServer || null;
     } catch (error) {
         const targetDomain = getPreferredBackupScope(targetUrl);
@@ -452,12 +486,14 @@ async function getPreferredBackupServer(env, targetUrl) {
 
 async function setPreferredBackupServer(env, targetUrl, backupCorsServer) {
     try {
+        const cacheKey = buildPreferredBackupCacheKey(targetUrl);
+        setLocalCache(cacheKey, backupCorsServer, PREFERRED_BACKUP_TTL_SECONDS * 1000);
+
         const backupServerCache = env?.BACKUP_SERVER_CACHE;
         if (!backupServerCache || typeof backupServerCache.put !== "function") {
             return;
         }
 
-        const cacheKey = buildPreferredBackupCacheKey(targetUrl);
         await backupServerCache.put(cacheKey, backupCorsServer, {
             expirationTtl: PREFERRED_BACKUP_TTL_SECONDS
         });
@@ -472,13 +508,15 @@ async function setPreferredBackupServer(env, targetUrl, backupCorsServer) {
 
 async function clearPreferredBackupServer(env, targetUrl, reason = "") {
     try {
+        const cacheKey = buildPreferredBackupCacheKey(targetUrl);
+        localBackupCache.delete(cacheKey);
+
         const backupServerCache = env?.BACKUP_SERVER_CACHE;
         if (!backupServerCache || typeof backupServerCache.delete !== "function") {
             return;
         }
 
         const targetDomain = getPreferredBackupScope(targetUrl);
-        const cacheKey = buildPreferredBackupCacheKey(targetUrl);
         await backupServerCache.delete(cacheKey);
 
         if (reason) {
@@ -719,6 +757,17 @@ export default {
             // Validate that it's a proper URL by trying to construct a URL object
             try {
                 const testUrl = new URL(targetUrl);
+                const hn = testUrl.hostname;
+
+                // Strict validation to block scanner requests and malformed URLs
+                // Must contain a dot (domain/IPv4), or be an IPv6 address, or be localhost
+                if (!hn.includes(".") && hn !== "localhost" && !(hn.startsWith("[") && hn.endsWith("]"))) {
+                    throw new Error("Hostname requires a valid domain or IP");
+                }
+                if (hn.includes("=") || hn.includes("&") || hn.includes("%")) {
+                    throw new Error("Hostname contains illegal characters");
+                }
+
                 // Preserve the full URL including path, query, and hash
                 targetUrl = testUrl.href; // Normalize the URL to ensure it's properly formatted
             } catch (e) {
